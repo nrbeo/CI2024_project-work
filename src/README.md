@@ -1,5 +1,4 @@
 # CI2024_project-work
-# Symbolic Regression Using Genetic Programming
 
 ## Introduction
 
