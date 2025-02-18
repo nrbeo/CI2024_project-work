@@ -7,13 +7,6 @@ from typing import Optional
 from tqdm import tqdm
 
 
-
-problem = np.load('problem_0.npz')
-x = problem['x']
-y = problem['y']
-print(f"Shape of x: {x.shape}")
-print(f"Shape of y: {y.shape}")
-
 MATH_CONSTANTS = ['pi', 'e']
 UNARY_OPS = ['sin', 'cos', 'exp', 'log']
 BINARY_OPS = ['+', '-', '*', '/']
@@ -80,7 +73,7 @@ def generate_random_tree(num_vars: int, mode: str = 'full', max_depth: int = 5, 
         node_type = random.choice(['unary_op', 'binary_op'])  # Ensure tree fills completely
     elif mode == 'grow':
         node_type = random.choices(['const', 'math_const', 'var', 'unary_op', 'binary_op'],
-                                   weights=[0.05, 0.2375, 0.2375, 0.2375, 0.2375])[0]  # Allows early stopping
+                                   weights=[0.05, 0.1, 0.2, 0.325, 0.325])[0]  # Allows early stopping
 
     # Generate the appropriate node type
     if node_type == 'const':
@@ -125,6 +118,8 @@ def is_valid_tree(node: Node) -> bool:
     return False  # Reject unknown node types
 
 # Function to evaluate a tree safely
+import warnings
+
 def evaluate_tree(node: Node, x: np.ndarray) -> np.ndarray:
     """
     Evaluates a tree safely. If any computation results in NaN/Inf, returns np.inf.
@@ -141,18 +136,32 @@ def evaluate_tree(node: Node, x: np.ndarray) -> np.ndarray:
             return x[int(node.value[1:]), :]  # Select the corresponding variable column
         elif node.type == 'unary_op':
             left = evaluate_tree(node.left, x)
-            result = getattr(np, node.value)(left)
+
+            # 🔧 Special handling for log to avoid divide-by-zero
+            if node.value == 'log':
+                left = np.where(left <= 1e-6, np.nan, left)  # Convert bad logs to NaN
+
+            # Suppress NumPy warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                result = getattr(np, node.value)(left)
+            
         elif node.type == 'binary_op':
             left = evaluate_tree(node.left, x)
             right = evaluate_tree(node.right, x)
+
+            # Prevent division by zero explicitly
             if node.value == '/':
-                right = np.where(right == 0, 1e-6, right)  # Prevent division by zero
-            result = getattr(np, node.value)(left, right)
+                right = np.where(np.abs(right) < 1e-6, np.nan, right)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                result = getattr(np, node.value)(left, right)
         
-        # Check for invalid numbers
+        # If result contains NaN, replace with np.inf
         if np.any(np.isnan(result)) or np.any(np.isinf(result)):
-            return np.full(x.shape[1], np.inf)  # Penalize trees with invalid values
-        
+            return np.full(x.shape[1], np.inf)
+
         return result
     except:
         return np.full(x.shape[1], np.inf)  # Penalize trees that crash
@@ -185,22 +194,19 @@ def fitness(tree: Node, x: np.ndarray, y: np.ndarray, lambda_penalty=0.01) -> fl
         float: The computed fitness score (lower is better).
     """
     try:
-        evalutate_y = evaluate_tree(tree, x)  # Evaluate tree to get predictions
-        
-        # If evaluation failed (returns np.inf), assign the worst possible score
-        if np.any(np.isinf(evalutate_y)):
+        eval_y = evaluate_tree(tree, x)
+
+        # If tree returns None, NaN, or Inf, assign worst score
+        if eval_y is None or np.any(np.isnan(eval_y)) or np.any(np.isinf(eval_y)):
             return float('inf')
-        
-        # Compute Mean Squared Error (MSE) between predictions and ground truth
-        mse = np.mean((evalutate_y - y) ** 2)
-        
-        # Compute tree depth as a measure of complexity
+
+        mse = np.mean((eval_y - y) ** 2)
         tree_depth = get_tree_depth(tree)
-        
-        # Final fitness score: MSE + (penalty for tree complexity)
-        return mse + lambda_penalty * tree_depth
+
+        return mse + lambda_penalty * tree_depth  # Balance accuracy and simplicity
     except:
-        return float('inf')  # If any error occurs, penalize the tree heavily
+        return float('inf')
+
 
 # Selection function using Tournament Selection
 # Tournament Selection Function
@@ -269,39 +275,49 @@ def collect_nodes(node: Node, take_root: bool = False) -> list:
 def crossover_trees(parent1: Node, parent2: Node) -> tuple:
     """
     Performs subtree crossover between two parent trees by swapping random subtrees.
-    
+
     Parameters:
         parent1 (Node): First parent tree.
         parent2 (Node): Second parent tree.
-    
+
     Returns:
         tuple: Two new offspring trees after crossover.
     """
     child1 = parent1.copy()
     child2 = parent2.copy()
 
-    if get_tree_depth(child1) == 1 or get_tree_depth(child2) == 1:
-        return child1, child2  # No crossover if trees are too small
-    
+    # Collect all nodes except root (we don't want to swap the entire tree)
+    nodes1 = collect_nodes(child1, take_root=False)
+    nodes2 = collect_nodes(child2, take_root=False)
+
+    if not nodes1 or not nodes2:
+        return child1, child2  # No crossover if there are no swappable nodes
+
     # Select random subtrees to swap
-    node1 = random.choice(collect_nodes(child1, take_root=False))
-    node2 = random.choice(collect_nodes(child2, take_root=False))
-    
-    # Swap the subtrees while keeping parent references
-    if node1.parent:
-        if node1.parent.left is node1:
-            node1.parent.left = node2
-        else:
-            node1.parent.right = node2
-    if node2.parent:
-        if node2.parent.left is node2:
-            node2.parent.left = node1
-        else:
-            node2.parent.right = node1
-    
-    # Update parent references after swapping
-    node1.parent, node2.parent = node2.parent, node1.parent
-    
+    node1 = random.choice(nodes1)
+    node2 = random.choice(nodes2)
+
+    # Get their parents
+    parent1 = node1.parent
+    parent2 = node2.parent
+
+    if not parent1 or not parent2:
+        return child1, child2  # Avoid swapping the root
+
+    # Swap the subtrees
+    if parent1.left == node1:
+        parent1.left = node2
+    else:
+        parent1.right = node2
+
+    if parent2.left == node2:
+        parent2.left = node1
+    else:
+        parent2.right = node1
+
+    # Fix parent pointers
+    node1.parent, node2.parent = parent2, parent1
+
     return child1, child2
 
 # Function to apply point mutation
@@ -400,8 +416,8 @@ def collapse_mutation(individual: Node) -> Node:
 
 
 def symreg(x: np.ndarray, y: np.ndarray, pop_size: int = 500, max_generations: int = 30, 
-                        max_depth: int = 10, max_const: int = 100, tournament_size: int = 2, 
-                        mutation_prob: float = 0.1, stagnation_window: int = 10) -> Node:
+           max_depth: int = 10, max_const: int = 100, tournament_size: int = 2, 
+           mutation_prob: float = 0.1, stagnation_window: int = 10) -> Node:
     """
     Runs a Genetic Programming algorithm to evolve symbolic expressions for regression.
 
@@ -422,77 +438,120 @@ def symreg(x: np.ndarray, y: np.ndarray, pop_size: int = 500, max_generations: i
     # Initialize population
     population = []
     pbar = tqdm(total=pop_size, desc="Creating initial population")
+
     while len(population) < pop_size:
         tree = generate_random_tree(x.shape[0], 'grow' if np.random.random() < 0.5 else 'full', max_depth, max_const)
-        if not np.all(np.isinf(evaluate_tree(tree, x))):  # Ensure valid tree
+        evaluated = evaluate_tree(tree, x)
+
+        if evaluated is not None and not np.any(np.isnan(evaluated)) and not np.any(np.isinf(evaluated)):
             population.append(tree)
             pbar.update(1)
+
     pbar.close()
-    
+
+    # Debug: Check initial diversity
+    print("Initial Population Sample :")
+    for i in range(min(5, len(population))):
+        print(f"Tree {i+1}: {population[i]}")
+
     # Track the best individual
     best_fitness = float('inf')
     best_individual = None
     generations_without_improvement = 0
-    
+
     for generation in tqdm(range(max_generations), desc="Evolving Generations"):
         offspring = []
+
         for _ in range(pop_size):
             if np.random.rand() < mutation_prob:
                 parent = tournament_selection(population, {ind: fitness(ind, x, y) for ind in population}, tournament_size)
                 mutation_type = random.choice(MUTATIONS)
+
+                mutated_child = None
                 if mutation_type == 'point':
-                    offspring.append(point_mutation(parent.copy(), x.shape[0], max_const))
+                    mutated_child = point_mutation(parent.copy(), x.shape[0], max_const)
                 elif mutation_type == 'permutation':
-                    offspring.append(permutation_mutation(parent.copy()))
+                    mutated_child = permutation_mutation(parent.copy())
                 elif mutation_type == 'hoist':
-                    offspring.append(hoist_mutation(parent.copy()))
+                    mutated_child = hoist_mutation(parent.copy())
                 elif mutation_type == 'collapse':
-                    offspring.append(collapse_mutation(parent.copy()))
-            else:  # Apply crossover
+                    mutated_child = collapse_mutation(parent.copy())
+
+                if mutated_child is not None:
+                    evaluated = evaluate_tree(mutated_child, x)
+                    if evaluated is not None and not np.any(np.isnan(evaluated)) and not np.any(np.isinf(evaluated)):
+                        offspring.append(mutated_child)  # Only keep valid mutations
+
+            else:
                 fitness_dict = {ind: fitness(ind, x, y) for ind in population}
-                parent1 = tournament_selection(population, fitness_dict, tournament_size)  
-                parent2 = tournament_selection(population, fitness_dict, tournament_size)           
+                parent1 = tournament_selection(population, fitness_dict, tournament_size)
+                parent2 = tournament_selection(population, fitness_dict, tournament_size)
+
                 while parent2 == parent1:
                     parent2 = tournament_selection(population, fitness_dict, tournament_size)
+
                 child1, child2 = crossover_trees(parent1, parent2)
-                offspring.extend([child1, child2])
-        
+
+                for child in [child1, child2]:
+                    evaluated = evaluate_tree(child, x)
+                    if evaluated is not None and not np.any(np.isnan(evaluated)) and not np.any(np.isinf(evaluated)):
+                        offspring.append(child)
+
         # Select survivors and update population
         population = sorted(population + offspring, key=lambda i: fitness(i, x, y))[:pop_size]
-        
+
+        # Debug: Check  diversity
+        print(f"New Population n°{generation} Sample:")
+        for i in range(min(5, len(population))):
+            print(f"Tree {i+1}: {population[i]}")
+
         # Check best individual
         current_best = min(population, key=lambda i: fitness(i, x, y))
         current_fitness = fitness(current_best, x, y)
-        
+
+        # Debugging: Track evolution progress
+        print(f"Generation {generation}: Best Fitness = {best_fitness}")
+        print(f"Best Formula so far: {best_individual}")
+
+        # Stagnation handling
         if current_fitness < best_fitness:
             best_fitness = current_fitness
             best_individual = current_best
             generations_without_improvement = 0
         else:
             generations_without_improvement += 1
-        
-        # Print progress
-        print(f"Generation {generation}: Best Fitness = {best_fitness}")
-        print(f"Best Formula: {best_individual}")
-        
-        # Early stopping conditions
-        if best_fitness < 1e-6:
-            print("Early stopping: Found a near-perfect solution.")
-            break
+
         if generations_without_improvement >= stagnation_window:
-            print(f"Early stopping: No improvement for {stagnation_window} generations.")
+            print(f"⚠️ Stagnation detected at Generation {generation}, stopping early.")
             break
-    
+
     return best_individual
 
 
 # Run Genetic Programming on Training Data
-problem = np.load('problem_0.npz')
+# Load dataset
+problem = np.load('data/problem_1.npz')  # Adjust path if necessary
 x = problem['x']
 y = problem['y']
 
+# Ensure x and y have compatible shapes
+print(f"Shape of x: {x.shape}")
+print(f"Shape of y: {y.shape}")
+
+# Define the maximum constant value based on dataset properties
 max_const = int(np.rint(np.maximum(np.max(np.abs(x)), np.max(np.abs(y)))))
 
-best_tree = symreg(x, y, pop_size=500, max_generations=50, max_depth = 7, max_const = max_const,stagnation_window = 50)
-print("Best Found Formula:", best_tree)
+# Run symbolic regression
+best_tree = symreg(
+    x, y,
+    pop_size=1000,  # Increase population size
+    max_generations=100,  # Allow more evolution
+    max_depth=10,  # Allow deeper trees
+    max_const=max_const,
+    tournament_size=5,  # Stronger selection pressure
+    mutation_prob=0.3,  # Increase mutation rate
+    stagnation_window=20  # Reduce stagnation threshold
+)
 
+# Print the best found formula
+print("Best Found Formula:", best_tree)
